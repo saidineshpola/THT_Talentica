@@ -1,0 +1,32 @@
+{
+  "id": "bill_1",
+  "original_filename": "Amazonbill.pdf",
+  "store_name": "amazon.in",
+  "date": "28.10.2019",
+  "items": [
+    {
+      "name": "Varasiddhi Silks Men's Formal Shirt (SH-05-42, Navy Blue, 42)",
+      "qty": 1,
+      "price": 538.1
+    },
+    {
+      "name": "Varasiddhi Silks Men's Formal Shirt (SH-05-40, Navy Blue, 40)",
+      "qty": 1,
+      "price": 538.1
+    },
+    {
+      "name": "Shipping Charges",
+      "qty": 1,
+      "price": 30.96
+    }
+  ],
+  "total": 1195.0,
+  "gst": 56.88,
+  "raw_text": " \n \namazon.in\nTax Invoice/Bill of Supply/Cash Memo\n(Original for Recipient)\nSold By:\nVarasiddhi Silk Exports\n75, 3rd Cross, Lalbagh Road\nBENGALURU, KARNATAKA, 560027\nIN\nPAN No: AACFV3325K\nGST Registration No: 29AACFV3325K1ZY\nBilling Address:\nMadhu B\nEurofins IT Solutions India Pvt Ltd,, 1st Floor,\nMaruti Platinum, Lakshminarayana Pura, AECS\nBENGALURU, KARNATAKA,\nLayou\n560037\nIN\nState/UT Code: 29\nShipping Address:\nMadhu B\nMadhu B\nOrder Number: 403-3225714-7676307\nOrder Date: 28.10.2019\nEurofins IT Solutions India Pvt Ltd,, 1st Floor,\nMaruti Platinum, Lakshminarayana Pura, AECS\nLayou\nBENGALURU, KARNATAKA, 560037\nIN\nState/UT Code: 29\nPlace of supply: KARNATAKA\nPlace of delivery: KARNATAKA\nInvoice Number : IN-761\nInvoice Details: KA-310565025-1920\nInvoice Date:: 28.10.2019\nSL\nNo\nDescription\nUnit\nPrice\nQty\nNet\nAmount\nTax\nRate\nTax\nType\nTax\nAmount\nTotal\nAmount\n1\nVarasiddhi Silks Men's Formal Shirt (SH-05-42, Navy Blue, 42) |\nB07KGF3KW8 (SH-05--42)\n538.10\n1\n3538.10 2.5% CGST\n13.45\n565.00\n2.5% SGST\n13.45\nShipping Charges\n30.96\n30.96\n2.5% CGST\n30.77\n32.50\n2.5% SGST\n30.77\n2\nVarasiddhi Silks Men's Formal Shirt (SH-05-40, Navy Blue, 40)|\nB07KGCS2X7 (SH-05--40)\n538.10\n1\n538.10 2.5% CGST\n13.45\n565.00\n2.5% SGST\n13.45\nShipping Charges\n30.96\n30.96\n2.5% CGST\n0.77\n32.50\n2.5% SGST\nR0.77\nTOTAL:\n56.88 1,195.00\nAmount in Words:\nOne Thousand One Hundred And Ninety-five only\nWhether tax is payable under reverse charge - No\nFor Varasiddhi Silk Exports:\nAuthorized Signatory\nASSPL-Amazon Seller Services Pvt. Lid., ARIPL-Amazon Retall India Pvt. Lid. jonly where Amazon Retall India Pvt. Lid ffliment center is co-located)\nCustomers desirous of avaling input GST credt are tequested to create a Business account and purchase on Amazon.inbusiness from Business eligble offers\nPlease note that this invoice is nol a demand for payment\nPage 1 ot 2\n\n",
+  "q_and_a": [
+    {
+      "question": "What is the total amount billed?",
+      "answer": "The total amount billed is \u20b91,195.00."
+    }
+  ]
+}

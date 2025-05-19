@@ -121,3 +121,6 @@ THT_Talentica/
 - Processed bills are stored in memory during runtime
 - Exported bills are saved in the `exported_bills` directory
 
+# load dot env
+from dotenv import load_dotenv
+load_dotenv()
