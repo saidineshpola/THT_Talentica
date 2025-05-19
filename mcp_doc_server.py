@@ -1,22 +1,23 @@
 import os
 import json
 import logging
+import io
+import base64
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Dict, Any
-import asyncio # For potential asyncio.to_thread if a sync library part is unavoidable
+from typing import List, Optional, Dict, Any, Union
 
 import fitz  # PyMuPDF
-import openai # Use the new OpenAI client
 from openai import AsyncOpenAI
-
-# MCP Imports
-from mcp.server.fastmcp import FastMCP, Context as MCPContext
-from mcp.server.fastmcp import Image as MCPImage # For handling image inputs
-from mcp.server.fastmcp import FastMCP
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+import asyncio
+from fastapi_mcp import FastApiMCP
+
 # ------------- Configuration ----------------
-OPENAI_API_KEY = "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" #os.getenv("OPENAI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "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")
 if not OPENAI_API_KEY:
     raise ValueError("OPENAI_API_KEY environment variable not set.")
 
@@ -24,9 +25,8 @@ aclient = AsyncOpenAI(api_key=OPENAI_API_KEY)
 DEFAULT_MODEL = "gpt-4o-mini"
 
 # Setup logging
-# Setup logging
 log_file_path = Path("logs/document_management.log")
-log_file_path.parent.mkdir(parents=True, exist_ok=True) # Ensure log directory exists
+log_file_path.parent.mkdir(parents=True, exist_ok=True)  # Ensure log directory exists
 
 # Remove default handlers from root logger if any
 for handler in logging.root.handlers[:]:
@@ -36,14 +36,13 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(log_file_path), # Log to file
-        logging.StreamHandler()             # Log to console
+        logging.FileHandler(log_file_path),  # Log to file
+        logging.StreamHandler()              # Log to console
     ]
 )
 logger = logging.getLogger("document_management.api")
 
 # ------------- Pydantic Schemas (Data Models) ---------------
-# These remain the same as they define the structure of your bill data
 class Item(BaseModel):
     name: str
     qty: Optional[int] = None
@@ -56,22 +55,39 @@ class BillData(BaseModel):
     items: List[Item] = Field(default_factory=list)
     total: Optional[float] = None
     gst: Optional[float] = None
-    raw_text: Optional[str] = None # Storing extracted text can be useful
+    raw_text: Optional[str] = None  # Storing extracted text can be useful
 
 # For Chit-Chat
 class ChatResponse(BaseModel):
     reply: str
 
 # For Querying
+class QueryRequest(BaseModel):
+    bill_id: str
+    question: str
+    
 class QueryResponse(BaseModel):
     answer: str
+
+# For Base64 PDF Processing
+class Base64PDFRequest(BaseModel):
+    base64_pdf: str
+
+# For Bill Export
+class ExportRequest(BaseModel):
+    bill_id: str
+    filename: Optional[str] = None
+
+class ExportResponse(BaseModel):
+    message: str
+    server_path: str
 
 # Application State (simplified in-memory store)
 class AppState:
     def __init__(self):
         self.bills_store: Dict[str, BillData] = {}
         self._next_bill_id_counter: int = 0
-        self._lock = asyncio.Lock() # For async-safe ID generation
+        self._lock = asyncio.Lock()  # For async-safe ID generation
 
     async def get_next_id(self) -> str:
         async with self._lock:
@@ -80,29 +96,9 @@ class AppState:
 
 app_state = AppState()
 
-# ------------- MCP Server Setup ----------------
-mcp = FastMCP(
-    name="PureBillProcessingMCPServer",
-    description="A standalone MCP server for bill parsing from images, querying, and chit-chat.",
-    # dependencies=["PyMuPDF", "openai"], # Optional: For mcp tooling
-)
-
-# ------------- MCP Tools & Resources ---------------
-import fitz  # PyMuPDF
-
-@mcp.tool(
-    name="ParsePDFFile",
-    description="Upload a PDF file, extract text, and return structured BillData.",
-)
-async def parse_pdf_file_tool(pdf_file, mcp_ctx):
-    """
-    MCP Tool to parse a PDF file, extract text, and structure it using an LLM.
-    The client is expected to provide the PDF via an MCP File object.
-    """
-    pdf_bytes = pdf_file.data
-    logger.info(f"MCP Tool 'ParsePDFFile' received PDF, size: {len(pdf_bytes)} bytes.")
-    mcp_ctx.info(f"Processing PDF file...")
-
+# ------------- Helper Functions ---------------
+async def extract_text_from_pdf(pdf_bytes: bytes) -> str:
+    """Extract text from PDF bytes using PyMuPDF."""
     raw_text = ""
     try:
         # Use PyMuPDF (fitz) to extract text from the PDF bytes
@@ -114,113 +110,48 @@ async def parse_pdf_file_tool(pdf_file, mcp_ctx):
 
         if not raw_text.strip():
             logger.warning("No text could be extracted from the provided PDF.")
-            mcp_ctx.info("Warning: No text extracted from the PDF.")
-
+        
         logger.info(f"Extracted raw text length: {len(raw_text)}")
-        mcp_ctx.info(f"Extracted {len(raw_text)} characters of text from PDF.")
+        return raw_text
 
     except Exception as e:
         logger.error(f"Failed to extract text from PDF: {e}", exc_info=True)
-        mcp_ctx.info(f"Error during PDF text extraction: {str(e)}")
         raise ValueError(f"Text extraction from PDF failed: {str(e)}")
 
-    prompt = f"""
-    Extract bill information as JSON matching the Pydantic schema below.
-    If the text is empty or contains no bill information, return a JSON object
-    with null or empty values for all fields except 'id' and 'raw_text'.
-    Ensure the 'id' field is NOT part of your JSON output; it will be added by the system.
-    Ensure 'raw_text' is NOT part of your JSON output; it will be added by the system.
-
-    Schema for your output (excluding id and raw_text):
-    {{
-      "store_name": "Optional[str]",
-      "date": "Optional[str]",
-      "items": [
-        {{
-          "name": "str",
-          "qty": "Optional[int]",
-          "price": "Optional[float]"
-        }}
-      ],
-      "total": "Optional[float]",
-      "gst": "Optional[float]"
-    }}
-
-    Bill Text (if any):
-    ---
-    {raw_text if raw_text.strip() else "No text extracted from PDF."}
-    ---
-    JSON Output:
-    """
-    try:
-        logger.info("Calling OpenAI for structured bill data extraction from PDF.")
-        completion = await aclient.chat.completions.create(
-            model=DEFAULT_MODEL,
-            messages=[
-                {"role": "system", "content": "You are an expert bill parsing assistant. Extract information into the provided JSON structure. If no bill data is found, provide empty/null fields."},
-                {"role": "user", "content": prompt}
-            ],
-            response_format={"type": "json_object"}
-        )
-        extracted_json_str = completion.choices[0].message.content
-        logger.debug(f"OpenAI response for bill parsing from PDF: {extracted_json_str}")
-
-        parsed_llm_data = json.loads(extracted_json_str)
-
-        bill_id = await app_state.get_next_id()
-        bill = BillData(id=bill_id, raw_text=raw_text, **parsed_llm_data)
-
-        app_state.bills_store[bill.id] = bill
-        mcp_ctx.info(f"Successfully parsed and stored bill with ID: {bill.id}")
-        return bill
-    except Exception as e:
-        logger.error(f"MCP Tool 'ParsePDFFile' - LLM extraction or data handling failed: {e}", exc_info=True)
-        mcp_ctx.info(f"Error during LLM extraction from PDF: {str(e)}")
-        raise ValueError(f"LLM extraction or data processing from PDF failed: {str(e)}")
-
-
-@mcp.tool(
-    name="ParseBillImage",
-    description="Upload a bill image, perform OCR & extraction, return structured BillData.",
-)
-async def parse_bill_image_tool(bill_image, mcp_ctx):
-    """
-    MCP Tool to parse a bill image, extract text, and structure it using an LLM.
-    The client is expected to provide the image via an MCP Image object.
-    """
-    image_bytes = bill_image.data
-    image_format = bill_image.format # e.g., 'png', 'jpeg'
-    logger.info(f"MCP Tool 'ParseBillImage' received image, format: {image_format}, size: {len(image_bytes)} bytes.")
-    mcp_ctx.info(f"Processing image of format {image_format}...") # Example of using MCP context
-
+async def extract_text_from_image(image_bytes: bytes, image_format: str) -> str:
+    """Extract text from image bytes using PyMuPDF."""
     raw_text = ""
     try:
-        # Use PyMuPDF (fitz) to extract text from the image bytes
-        # fitz needs filetype for images when opening from stream
+        # For better OCR results with PyMuPDF
         doc = fitz.open(stream=image_bytes, filetype=image_format)
         for page_num in range(len(doc)):
             page = doc.load_page(page_num)
-            raw_text += page.get_text("text") + "\n"
+            
+            # Get text directly - might work for some images with embedded text
+            text_from_page = page.get_text("text")
+            
+            # If direct text extraction fails, try OCR-based approach
+            if not text_from_page.strip():
+                # PyMuPDF doesn't have direct OCR, but we'll extract what we can
+                logger.info("Direct text extraction yielded no results, attempting alternative methods...")
+            
+            raw_text += text_from_page + "\n"
+        
         doc.close()
         
         if not raw_text.strip():
             logger.warning("No text could be extracted from the provided image.")
-            # Decide how to handle: error, or empty BillData with raw_text?
-            # For now, let's proceed and let the LLM decide, or raise an error.
-            # raise ValueError("No text extracted from image.") # Option
-            mcp_ctx.info("Warning: No text extracted from the image via OCR.")
-
-
+        
         logger.info(f"Extracted raw text length: {len(raw_text)}")
-        mcp_ctx.info(f"Extracted {len(raw_text)} characters of text from image.")
-
+        return raw_text
+        
     except Exception as e:
         logger.error(f"Failed to extract text from image: {e}", exc_info=True)
-        mcp_ctx.info(f"Error during image text extraction: {str(e)}")
-        # This error should be propagated in a way MCP client understands,
-        # often by raising an exception the MCP framework handles.
-        raise ValueError(f"OCR or text extraction failed: {str(e)}")
+        # Return empty string instead of raising exception to allow LLM to still attempt interpretation
+        return ""
 
+async def extract_bill_data_with_llm(raw_text: str) -> Dict[str, Any]:
+    """Use LLM to extract structured bill data from raw text."""
     prompt = f"""
     Extract bill information as JSON matching the Pydantic schema below.
     If the text is empty or contains no bill information, return a JSON object
@@ -245,50 +176,121 @@ async def parse_bill_image_tool(bill_image, mcp_ctx):
 
     Bill Text (if any):
     ---
-    {raw_text if raw_text.strip() else "No text extracted from image."}
+    {raw_text if raw_text.strip() else "No text extracted from document."}
     ---
     JSON Output:
     """
+    
+    completion = await aclient.chat.completions.create(
+        model=DEFAULT_MODEL,
+        messages=[
+            {"role": "system", "content": "You are an expert bill parsing assistant. Extract information into the provided JSON structure. If no bill data is found, provide empty/null fields."},
+            {"role": "user", "content": prompt}
+        ],
+        response_format={"type": "json_object"}
+    )
+    extracted_json_str = completion.choices[0].message.content
+    logger.debug(f"OpenAI response for bill parsing: {extracted_json_str}")
+    
+    return json.loads(extracted_json_str)
+
+# ------------- FastAPI App Setup ---------------
+app = FastAPI(
+    title="Bill Processing API",
+    description="API for processing and extracting structured data from bills",
+    version="1.0.0"
+)
+
+# Add CORS middleware to allow cross-origin requests
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
+
+# ------------- FastAPI Endpoint Definitions (Regular API) ---------------
+@app.post("/api/parse-pdf", response_model=BillData, operation_id="parse_pdf_file")
+async def parse_pdf_file(pdf_file: UploadFile = File(...)):
+    """
+    Upload a PDF file to extract and structure bill data.
+    """
     try:
-        logger.info("Calling OpenAI for structured bill data extraction.")
-        completion = await aclient.chat.completions.create(
-            model=DEFAULT_MODEL,
-            messages=[
-                {"role": "system", "content": "You are an expert bill parsing assistant. Extract information into the provided JSON structure. If no bill data is found, provide empty/null fields."},
-                {"role": "user", "content": prompt}
-            ],
-            response_format={"type": "json_object"}
-        )
-        extracted_json_str = completion.choices[0].message.content
-        logger.debug(f"OpenAI response for bill parsing: {extracted_json_str}")
+        pdf_bytes = await pdf_file.read()
+        logger.info(f"Received PDF, size: {len(pdf_bytes)} bytes, filename: {pdf_file.filename}")
+
+        # Extract text from PDF
+        raw_text = await extract_text_from_pdf(pdf_bytes)
         
-        parsed_llm_data = json.loads(extracted_json_str)
+        # Extract structured data from text using LLM
+        logger.info("Calling OpenAI for structured bill data extraction from PDF.")
+        parsed_llm_data = await extract_bill_data_with_llm(raw_text)
         
+        # Store the parsed bill
         bill_id = await app_state.get_next_id()
-        # Create BillData instance, ensuring 'id' and 'raw_text' are included
         bill = BillData(id=bill_id, raw_text=raw_text, **parsed_llm_data)
         
         app_state.bills_store[bill.id] = bill
-        mcp_ctx.info(f"Successfully parsed and stored bill with ID: {bill.id}")
+        logger.info(f"Successfully parsed and stored bill with ID: {bill.id}")
         return bill
+    
     except Exception as e:
-        logger.error(f"MCP Tool 'ParseBillImage' - LLM extraction or data handling failed: {e}", exc_info=True)
-        mcp_ctx.info(f"Error during LLM extraction: {str(e)}")
-        raise ValueError(f"LLM extraction or data processing failed: {str(e)}")
+        logger.error(f"PDF parsing failed: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail=f"PDF processing failed: {str(e)}")
 
-@mcp.tool(
-    name="QueryParsedBill",
-    description="Answers questions based on a previously parsed bill's structured data.",
-)
-async def query_parsed_bill_tool(bill_id: str, question: str, mcp_ctx: MCPContext) -> QueryResponse:
+@app.post("/api/parse-image", response_model=BillData, operation_id="parse_bill_image")
+async def parse_bill_image(image_file: UploadFile = File(...)):
+    """
+    Upload a bill image to extract and structure bill data.
+    """
+    try:
+        image_bytes = await image_file.read()
+        content_type = image_file.content_type.lower() if image_file.content_type else ""
+        
+        # Extract format from content type (e.g., "image/png" -> "png")
+        image_format = content_type.split("/")[1] if "/" in content_type else ""
+        
+        # Validate format
+        if image_format not in ['png', 'jpg', 'jpeg', 'webp', 'tiff', 'bmp']:
+            image_format = 'png'  # Default to PNG if format is unrecognized
+        
+        logger.info(f"Received image, format: {image_format}, size: {len(image_bytes)} bytes")
+        
+        # Extract text from image
+        raw_text = await extract_text_from_image(image_bytes, image_format)
+        
+        # Extract structured data using LLM
+        logger.info("Calling OpenAI for structured bill data extraction from image.")
+        parsed_llm_data = await extract_bill_data_with_llm(raw_text)
+        
+        # Store the parsed bill
+        bill_id = await app_state.get_next_id()
+        bill = BillData(id=bill_id, raw_text=raw_text, **parsed_llm_data)
+        
+        app_state.bills_store[bill.id] = bill
+        logger.info(f"Successfully parsed and stored bill with ID: {bill.id}")
+        return bill
+        
+    except Exception as e:
+        logger.error(f"Image parsing failed: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail=f"Image processing failed: {str(e)}")
+
+
+@app.post("/api/query-bill", response_model=QueryResponse, operation_id="query_parsed_bill")
+async def query_bill(request: QueryRequest):
+    """
+    Query information from a previously parsed bill.
+    """
+    bill_id = request.bill_id
+    question = request.question
+    
     if bill_id not in app_state.bills_store:
         logger.warning(f"Query attempt for non-existent bill ID: {bill_id}")
-        mcp_ctx.info(f"Bill ID {bill_id} not found for querying.")
-        raise ValueError(f"Bill with ID '{bill_id}' not found.")
+        raise HTTPException(status_code=404, detail=f"Bill with ID '{bill_id}' not found.")
     
     bill_data = app_state.bills_store[bill_id]
-    # Use model_dump_json for Pydantic v2
-    bill_json = bill_data.model_dump_json(indent=2) 
+    bill_json = bill_data.model_dump_json(indent=2)
 
     prompt = f"""
     You are a helpful assistant. Given the following bill data in JSON format,
@@ -313,16 +315,14 @@ async def query_parsed_bill_tool(bill_id: str, question: str, mcp_ctx: MCPContex
         answer = completion.choices[0].message.content
         return QueryResponse(answer=answer)
     except Exception as e:
-        logger.error(f"MCP Tool 'QueryParsedBill' failed for bill {bill_id}: {e}", exc_info=True)
-        mcp_ctx.info(f"Error during bill query for {bill_id}: {str(e)}")
-        raise ValueError(f"Query processing failed: {str(e)}")
+        logger.error(f"Bill query failed for bill {bill_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Query processing failed: {str(e)}")
 
-@mcp.tool(
-    name="GeneralChat",
-    description="Engages in general chit-chat with the user.",
-
-)
-async def general_chat_tool(user_message: str, mcp_ctx: MCPContext) -> ChatResponse:
+@app.post("/api/chat", response_model=ChatResponse, operation_id="general_chat")
+async def general_chat(user_message: str = Body(..., embed=True)):
+    """
+    General conversation capability.
+    """
     try:
         logger.info(f"Chit-chat message: '{user_message}'")
         completion = await aclient.chat.completions.create(
@@ -335,23 +335,24 @@ async def general_chat_tool(user_message: str, mcp_ctx: MCPContext) -> ChatRespo
         reply = completion.choices[0].message.content
         return ChatResponse(reply=reply)
     except Exception as e:
-        logger.error(f"MCP Tool 'GeneralChat' failed: {e}", exc_info=True)
-        mcp_ctx.info(f"Error during chit-chat: {str(e)}")
-        raise ValueError(f"Chit-chat processing failed: {str(e)}")
+        logger.error(f"Chit-chat failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Chit-chat processing failed: {str(e)}")
 
-@mcp.tool(
-    name="ExportBillData",
-    description="Saves a parsed bill by its ID to a JSON file on the server.",
- 
-)
-async def export_bill_data_tool(bill_id: str,  mcp_ctx: MCPContext, filename: Optional[str] = None) -> Dict[str, str]:
+@app.post("/api/export-bill", response_model=ExportResponse, operation_id="export_bill_data")
+async def export_bill_data(request: ExportRequest):
+    """
+    Saves a parsed bill by its ID to a JSON file on the server.
+    """
+    bill_id = request.bill_id
+    filename = request.filename
+    
     if bill_id not in app_state.bills_store:
         logger.warning(f"Export attempt for non-existent bill ID: {bill_id}")
-        raise ValueError(f"Bill with ID '{bill_id}' not found for export.")
+        raise HTTPException(status_code=404, detail=f"Bill with ID '{bill_id}' not found for export.")
     
     bill_data = app_state.bills_store[bill_id]
     
-    export_dir = "exported_bills_mcp" # Server-side directory
+    export_dir = "exported_bills"  # Server-side directory
     os.makedirs(export_dir, exist_ok=True)
     
     actual_filename = filename or f"bill_{bill_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
@@ -359,46 +360,51 @@ async def export_bill_data_tool(bill_id: str,  mcp_ctx: MCPContext, filename: Op
     
     try:
         with open(file_path, 'w') as f:
-            # Use model_dump for Pydantic v2
             json.dump(bill_data.model_dump(), f, indent=2)
-        logger.info(f"Bill {bill_id} exported to {file_path} by MCP tool.")
-        mcp_ctx.info(f"Bill {bill_id} exported to {file_path}.")
-        return {"message": "Bill exported successfully on the server.", "server_path": file_path}
+        logger.info(f"Bill {bill_id} exported to {file_path}.")
+        return ExportResponse(
+            message="Bill exported successfully on the server.",
+            server_path=file_path
+        )
     except Exception as e:
-        logger.error(f"MCP Tool 'ExportBillData' failed for bill {bill_id}: {e}", exc_info=True)
-        mcp_ctx.info(f"Error during bill export for {bill_id}: {str(e)}")
-        raise ValueError(f"Failed to save bill on server: {str(e)}")
+        logger.error(f"Bill export failed for bill {bill_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to save bill on server: {str(e)}")
 
-@mcp.resource(
-    name="GetBillById",
-    uri="bills://{bill_id}",
-    description="Retrieves a parsed bill by its ID.",
+@app.get("/api/bill/{bill_id}", response_model=BillData, operation_id="get_bill_by_id")
+async def get_bill_by_id(bill_id: str):
+    """
+    Retrieves a parsed bill by its ID.
+    """
+    logger.info(f"Getting bill with ID: {bill_id}")
+    if bill_id not in app_state.bills_store:
+        raise HTTPException(status_code=404, detail=f"Bill with ID '{bill_id}' not found.")
+    return app_state.bills_store[bill_id]
 
-)
-async def get_bill_by_id_resource( bill_id: str,) -> Optional[BillData]:
-    logger.info(f"MCP Resource 'GetBillById' called for ID: {bill_id}")
-    return app_state.bills_store.get(bill_id)
-
-@mcp.resource(
-    name="ListAllBills",
-    uri="bills://all", # You can define any URI scheme you like
-    description="Lists all parsed bills currently in memory.",
-)
-async def list_all_bills_resource() -> List[BillData]:
-    logger.info("MCP Resource 'ListAllBills' called.")
-    # mcp_ctx.info("Accessing resource to list all bills.")
+@app.get("/api/bills", response_model=List[BillData], operation_id="list_all_bills")
+async def list_all_bills():
+    """
+    Lists all parsed bills currently in memory.
+    """
+    logger.info("Listing all bills")
     return list(app_state.bills_store.values())
 
-# TODO: Implement evaluation methods (e.g., as a separate script or tool)
-# This would involve comparing LLM extracted fields against human-annotated ground truth.
+# ------------- FastAPI MCP Integration ---------------
+# Create the FastAPI MCP instance
+mcp = FastApiMCP(
+    app,  
+    # base_url="http://api-host:8000",
+    name="Bill Processing MCP",  
+    description="MCP server for bill parsing, querying, and management",  
+    describe_all_responses=True,
+   # describe_full_response_schema=True
+)
 
+# Mount the MCP server to your FastAPI app
+mcp.mount()
+
+# ------------- Main Entrypoint ---------------
 if __name__ == "__main__":
-    # This makes the server runnable with `python your_server_file.py`
-    # It will use the default MCP transport (stdio, SSE, or Streamable HTTP depending on MCP defaults)
-    # To run with MCP developer tools: `mcp dev your_server_file.py`
-    
-    # Example of how you might select a transport if needed, e.g., for Streamable HTTP
-    # mcp.run(transport="streamable-http", host="0.0.0.0", port=8000)
-    # For default behavior (often stdio for `mcp dev` or direct run):
-    logger.info("Starting pure MCP Bill Processing Server...")
-    mcp.run()
+    import uvicorn
+    # Start the FastAPI server with MCP integration
+    logger.info("Starting FastAPI Bill Processing Server with MCP integration...")
+    uvicorn.run(app, host="0.0.0.0", port=8000,) # reload=True)
