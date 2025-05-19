@@ -1,3 +1,45 @@
+# import httpx
+# import logging
+# from pathlib import Path
+# from mcp.server.fastmcp import FastMCP
+
+# # Set up logging
+# log_file_path = Path(__file__).parent / "logs" / "app.log"
+# log_file_path.parent.mkdir(exist_ok=True)
+
+# logging.basicConfig(
+#     level=logging.INFO,
+#     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+#     handlers=[
+#         logging.FileHandler(log_file_path),  # Log to file
+#         logging.StreamHandler()              # Log to console
+#     ]
+# )
+# logger = logging.getLogger(__name__)
+
+# mcp = FastMCP("My App")
+
+# @mcp.tool()
+# def calculate_bmi(weight_kg: float, height_m: float) -> float:
+#     """Calculate BMI given weight in kg and height in meters"""
+#     logger.info(f"Calculating BMI for weight={weight_kg}kg, height={height_m}m")
+#     bmi = weight_kg / (height_m**2)
+#     logger.info(f"Calculated BMI: {bmi}")
+#     return bmi
+
+# @mcp.tool()
+# async def fetch_weather(city: str) -> str:
+#     """Fetch current weather for a city"""
+#     logger.info(f"Fetching weather for city: {city}")
+#     try:
+#         async with httpx.AsyncClient() as client:
+#             response = await client.get(f"https://api.weather.com/{city}")
+#             logger.info(f"Weather data fetched successfully for {city}")
+#             return response.text
+#     except Exception as e:
+#         logger.error(f"Error fetching weather for {city}: {str(e)}")
+#         raise
+
 import os
 import json
 import logging
@@ -7,17 +49,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Union
 
-import fitz  # PyMuPDF
+import pymupdf as fitz 
 from openai import AsyncOpenAI
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import asyncio
-from fastapi_mcp import FastApiMCP
+from mcp.server.fastmcp import FastMCP
 
 # ------------- Configuration ----------------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "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")
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY environment variable not set.")
 
 aclient = AsyncOpenAI(api_key=OPENAI_API_KEY)
 DEFAULT_MODEL = "gpt-4o-mini"
@@ -60,25 +101,8 @@ class ChatResponse(BaseModel):
     reply: str
 
 # For Querying
-class QueryRequest(BaseModel):
-    bill_id: str
-    question: str
-    
 class QueryResponse(BaseModel):
     answer: str
-
-# For Base64 PDF Processing
-class Base64PDFRequest(BaseModel):
-    base64_pdf: str
-
-# For Bill Export
-class ExportRequest(BaseModel):
-    bill_id: str
-    filename: Optional[str] = None
-
-class ExportResponse(BaseModel):
-    message: str
-    server_path: str
 
 # Application State (simplified in-memory store)
 class AppState:
@@ -192,34 +216,33 @@ async def extract_bill_data_with_llm(raw_text: str) -> Dict[str, Any]:
     
     return json.loads(extracted_json_str)
 
-# ------------- FastAPI App Setup ---------------
-app = FastAPI(
-    title="Bill Processing API",
-    description="API for processing and extracting structured data from bills",
-    version="1.0.0"
-)
+# ------------- FastMCP Setup ---------------
+mcp = FastMCP("Bill Processing MCP", dependencies=[
+    # Add any dependencies here if needed"
+    "pymupdf",
+    "openai",
+    "pydantic",
+    "asyncio",
+    
+    ])
 
-# Add CORS middleware to allow cross-origin requests
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
-    allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
-)
-
-# ------------- FastAPI Endpoint Definitions (Regular API) ---------------
-@app.post("/api/parse-pdf", response_model=BillData, operation_id="parse_pdf_file")
-async def parse_pdf_file(pdf_file: UploadFile = File(...)):
+@mcp.tool()
+async def parse_pdf_file(pdf_content: bytes, filename: str) -> BillData:
     """
-    Upload a PDF file to extract and structure bill data.
+    Parse a PDF file to extract and structure bill data.
+    
+    Args:
+        pdf_content: The binary content of the PDF file
+        filename: Name of the uploaded file
+        
+    Returns:
+        Structured bill data extracted from the PDF
     """
     try:
-        pdf_bytes = await pdf_file.read()
-        logger.info(f"Received PDF, size: {len(pdf_bytes)} bytes, filename: {pdf_file.filename}")
+        logger.info(f"Received PDF, size: {len(pdf_content)} bytes, filename: {filename}")
 
         # Extract text from PDF
-        raw_text = await extract_text_from_pdf(pdf_bytes)
+        raw_text = await extract_text_from_pdf(pdf_content)
         
         # Extract structured data from text using LLM
         logger.info("Calling OpenAI for structured bill data extraction from PDF.")
@@ -235,28 +258,30 @@ async def parse_pdf_file(pdf_file: UploadFile = File(...)):
     
     except Exception as e:
         logger.error(f"PDF parsing failed: {e}", exc_info=True)
-        raise HTTPException(status_code=400, detail=f"PDF processing failed: {str(e)}")
+        raise ValueError(f"PDF processing failed: {str(e)}")
 
-@app.post("/api/parse-image", response_model=BillData, operation_id="parse_bill_image")
-async def parse_bill_image(image_file: UploadFile = File(...)):
+@mcp.tool()
+async def parse_bill_image(image_content: bytes, filename: str, image_format: str = "png") -> BillData:
     """
-    Upload a bill image to extract and structure bill data.
+    Parse a bill image to extract and structure bill data.
+    
+    Args:
+        image_content: The binary content of the image file
+        filename: Name of the uploaded file
+        image_format: Format of the image (png, jpg, jpeg, etc.)
+        
+    Returns:
+        Structured bill data extracted from the image
     """
     try:
-        image_bytes = await image_file.read()
-        content_type = image_file.content_type.lower() if image_file.content_type else ""
-        
-        # Extract format from content type (e.g., "image/png" -> "png")
-        image_format = content_type.split("/")[1] if "/" in content_type else ""
-        
         # Validate format
         if image_format not in ['png', 'jpg', 'jpeg', 'webp', 'tiff', 'bmp']:
             image_format = 'png'  # Default to PNG if format is unrecognized
         
-        logger.info(f"Received image, format: {image_format}, size: {len(image_bytes)} bytes")
+        logger.info(f"Received image, format: {image_format}, size: {len(image_content)} bytes")
         
         # Extract text from image
-        raw_text = await extract_text_from_image(image_bytes, image_format)
+        raw_text = await extract_text_from_image(image_content, image_format)
         
         # Extract structured data using LLM
         logger.info("Calling OpenAI for structured bill data extraction from image.")
@@ -272,20 +297,23 @@ async def parse_bill_image(image_file: UploadFile = File(...)):
         
     except Exception as e:
         logger.error(f"Image parsing failed: {e}", exc_info=True)
-        raise HTTPException(status_code=400, detail=f"Image processing failed: {str(e)}")
+        raise ValueError(f"Image processing failed: {str(e)}")
 
-
-@app.post("/api/query-bill", response_model=QueryResponse, operation_id="query_parsed_bill")
-async def query_bill(request: QueryRequest):
+@mcp.tool()
+async def query_bill(bill_id: str, question: str) -> QueryResponse:
     """
     Query information from a previously parsed bill.
-    """
-    bill_id = request.bill_id
-    question = request.question
     
+    Args:
+        bill_id: The ID of the bill to query
+        question: The question to ask about the bill
+        
+    Returns:
+        An answer to the question based on the bill data
+    """
     if bill_id not in app_state.bills_store:
         logger.warning(f"Query attempt for non-existent bill ID: {bill_id}")
-        raise HTTPException(status_code=404, detail=f"Bill with ID '{bill_id}' not found.")
+        raise ValueError(f"Bill with ID '{bill_id}' not found.")
     
     bill_data = app_state.bills_store[bill_id]
     bill_json = bill_data.model_dump_json(indent=2)
@@ -314,12 +342,18 @@ async def query_bill(request: QueryRequest):
         return QueryResponse(answer=answer)
     except Exception as e:
         logger.error(f"Bill query failed for bill {bill_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Query processing failed: {str(e)}")
+        raise ValueError(f"Query processing failed: {str(e)}")
 
-@app.post("/api/chat", response_model=ChatResponse, operation_id="general_chat")
-async def general_chat(user_message: str = Body(..., embed=True)):
+@mcp.tool()
+async def general_chat(user_message: str) -> ChatResponse:
     """
-    General conversation capability.
+    Provide general conversation capability.
+    
+    Args:
+        user_message: The message from the user
+        
+    Returns:
+        A response to the user's message
     """
     try:
         logger.info(f"Chit-chat message: '{user_message}'")
@@ -334,19 +368,23 @@ async def general_chat(user_message: str = Body(..., embed=True)):
         return ChatResponse(reply=reply)
     except Exception as e:
         logger.error(f"Chit-chat failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Chit-chat processing failed: {str(e)}")
+        raise ValueError(f"Chit-chat processing failed: {str(e)}")
 
-@app.post("/api/export-bill", response_model=ExportResponse, operation_id="export_bill_data")
-async def export_bill_data(request: ExportRequest):
+@mcp.tool()
+async def export_bill_data(bill_id: str, filename: Optional[str] = None) -> Dict[str, str]:
     """
-    Saves a parsed bill by its ID to a JSON file on the server.
-    """
-    bill_id = request.bill_id
-    filename = request.filename
+    Save a parsed bill by its ID to a JSON file.
     
+    Args:
+        bill_id: The ID of the bill to export
+        filename: Optional custom filename for the exported bill
+        
+    Returns:
+        Information about the exported bill file
+    """
     if bill_id not in app_state.bills_store:
         logger.warning(f"Export attempt for non-existent bill ID: {bill_id}")
-        raise HTTPException(status_code=404, detail=f"Bill with ID '{bill_id}' not found for export.")
+        raise ValueError(f"Bill with ID '{bill_id}' not found for export.")
     
     bill_data = app_state.bills_store[bill_id]
     
@@ -360,49 +398,37 @@ async def export_bill_data(request: ExportRequest):
         with open(file_path, 'w') as f:
             json.dump(bill_data.model_dump(), f, indent=2)
         logger.info(f"Bill {bill_id} exported to {file_path}.")
-        return ExportResponse(
-            message="Bill exported successfully on the server.",
-            server_path=file_path
-        )
+        return {
+            "message": "Bill exported successfully on the server.",
+            "server_path": file_path
+        }
     except Exception as e:
         logger.error(f"Bill export failed for bill {bill_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to save bill on server: {str(e)}")
+        raise ValueError(f"Failed to save bill on server: {str(e)}")
 
-@app.get("/api/bill/{bill_id}", response_model=BillData, operation_id="get_bill_by_id")
-async def get_bill_by_id(bill_id: str):
+@mcp.tool()
+async def get_bill_by_id(bill_id: str) -> BillData:
     """
-    Retrieves a parsed bill by its ID.
+    Retrieve a parsed bill by its ID.
+    
+    Args:
+        bill_id: The ID of the bill to retrieve
+        
+    Returns:
+        The bill data associated with the ID
     """
     logger.info(f"Getting bill with ID: {bill_id}")
     if bill_id not in app_state.bills_store:
-        raise HTTPException(status_code=404, detail=f"Bill with ID '{bill_id}' not found.")
+        raise ValueError(f"Bill with ID '{bill_id}' not found.")
     return app_state.bills_store[bill_id]
 
-@app.get("/api/bills", response_model=List[BillData], operation_id="list_all_bills")
-async def list_all_bills():
+@mcp.tool()
+async def list_all_bills() -> List[BillData]:
     """
-    Lists all parsed bills currently in memory.
+    List all parsed bills currently in memory.
+    
+    Returns:
+        A list of all stored bill data
     """
     logger.info("Listing all bills")
     return list(app_state.bills_store.values())
-
-# ------------- FastAPI MCP Integration ---------------
-# Create the FastAPI MCP instance
-mcp = FastApiMCP(
-    app,  
-    # base_url="http://api-host:8000",
-    name="Bill Processing MCP",  
-    description="MCP server for bill parsing, querying, and management",  
-    describe_all_responses=True,
-   # describe_full_response_schema=True
-)
-
-# Mount the MCP server to your FastAPI app
-mcp.mount()
-
-# ------------- Main Entrypoint ---------------
-if __name__ == "__main__":
-    import uvicorn
-    # Start the FastAPI server with MCP integration
-    logger.info("Starting FastAPI Bill Processing Server with MCP integration...")
-    uvicorn.run(app, host="0.0.0.0", port=8000,) # reload=True)
