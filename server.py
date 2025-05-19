@@ -6,47 +6,16 @@ import base64
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Union
-import shutil # For creating dummy files in main_test_new_flow
-
 import pymupdf as fitz
-from openai import AsyncOpenAI
-from pydantic import BaseModel, Field
 import asyncio
 from mcp.server.fastmcp import FastMCP
 
-from text_extractors import TextExtractionBackend, TextExtractorFactory
-
-# ------------- Configuration ----------------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "YOUR_OPENAI_API_KEY_FALLBACK") # Replace or set env var
-if not OPENAI_API_KEY or OPENAI_API_KEY == "YOUR_OPENAI_API_KEY_FALLBACK":
-    try:
-        from dotenv import load_dotenv
-        load_dotenv()
-        OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-        if not OPENAI_API_KEY:
-            # To prevent failing entirely if .env is missing or key not set,
-            # provide a placeholder. AsyncOpenAI will fail later if this is used.
-            logger_config = logging.getLogger("config_logger")
-            logger_config.warning(
-                "OPENAI_API_KEY environment variable not set and not found in .env. "
-                "Using a placeholder. API calls will fail if not replaced."
-            )
-            OPENAI_API_KEY = "placeholder_api_key_ensure_set_in_env_or_dotenv"
-    except ImportError:
-        logger_config = logging.getLogger("config_logger")
-        logger_config.warning(
-            "python-dotenv not installed. OPENAI_API_KEY must be set in the environment. "
-            "Using a placeholder. API calls will fail if not replaced."
-        )
-        OPENAI_API_KEY = "placeholder_api_key_ensure_set_in_env_or_dotenv"
-    except Exception as e:
-        logger_config = logging.getLogger("config_logger")
-        logger_config.error(f"Error loading .env: {e}")
-        OPENAI_API_KEY = "placeholder_api_key_ensure_set_in_env_or_dotenv"
+from assets.base_classes import AppState, BillData, ChatResponse, QAPair, QueryResponse
+from text_extractors import extract_text_from_image, extract_text_from_pdf
+from utils import ASSETS_BASE_DIR, DEFAULT_MODEL, UPLOAD_DIR, _internal_process_and_store_bill, save_bill_json, setup_directories, aclient
 
 
-aclient = AsyncOpenAI(api_key=OPENAI_API_KEY)
-DEFAULT_MODEL = "gpt-4o-mini"
+
 
 # Setup logging
 log_file_path = Path("logs/document_management.log")
@@ -65,228 +34,14 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("document_management.api")
-
-# ------------- Pydantic Schemas (Data Models) ---------------
-class Item(BaseModel):
-    name: str
-    qty: Optional[int] = None
-    price: Optional[float] = None
-
-class QAPair(BaseModel):
-    question: str
-    answer: str
-
-class BillData(BaseModel):
-    id: str
-    original_filename: Optional[str] = None
-    store_name: Optional[str] = None
-    date: Optional[str] = None
-    items: List[Item] = Field(default_factory=list)
-    total: Optional[float] = None
-    gst: Optional[float] = None
-    raw_text: Optional[str] = None
-    q_and_a: List[QAPair] = Field(default_factory=list)
-
-class ChatResponse(BaseModel):
-    reply: str
-
-class QueryResponse(BaseModel):
-    answer: str
-    bill_id: Optional[str] = None
-
-# Application State
-class AppState:
-    def __init__(self):
-        self.bills_store: Dict[str, BillData] = {} # Stores processed BillData objects, keyed by bill.id
-        self._next_bill_id_counter: int = 0
-        self._lock = asyncio.Lock()
-
-    async def get_next_id(self) -> str:
-        async with self._lock:
-            self._next_bill_id_counter += 1
-            return f"bill_{self._next_bill_id_counter}"
-
-    async def find_bill(self, identifier: str) -> Optional[BillData]:
-        """Finds a bill by its internal ID or original_filename."""
-        if identifier in self.bills_store:
-            return self.bills_store[identifier]
-        for bill in self.bills_store.values():
-            if bill.original_filename == identifier:
-                return bill
-        return None
-
 app_state = AppState()
 
 # ------------- Directory Setup ---------------
-# TODO: Update these paths to your local environment
-UPLOAD_DIR = Path("C:/Users/user/Desktop/projects/THT_Talentica/assets/bills/uploads")
-ASSETS_BASE_DIR = Path("C:/Users/user/Desktop/projects/THT_Talentica/assets/bills") # For processed copies, JSONs, exports
-def setup_directories():
-    """Ensures all necessary directories exist."""
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    (ASSETS_BASE_DIR / "pdfs").mkdir(parents=True, exist_ok=True)
-    (ASSETS_BASE_DIR / "images").mkdir(parents=True, exist_ok=True)
-    (ASSETS_BASE_DIR / "json").mkdir(parents=True, exist_ok=True)
-    (ASSETS_BASE_DIR / "exports").mkdir(parents=True, exist_ok=True)
-    logger.info(f"Standard directories ensured. Uploads expected in: {UPLOAD_DIR}")
+
+
 
 setup_directories() # Call at import time
 
-# ------------- Helper Functions ---------------
-
-async def extract_text_from_pdf(pdf_bytes: bytes, backend: TextExtractionBackend = TextExtractionBackend.PYMUPDF) -> str:
-    """
-    Extract text from PDF using the specified backend.
-    
-    Args:
-        pdf_bytes: PDF content as bytes
-        backend: TextExtractionBackend enum specifying which extractor to use
-        
-    Returns:
-        str: Extracted text
-        
-    Raises:
-        ValueError: If text extraction fails
-    """
-    raw_text = ""
-    try:
-        extractor = TextExtractorFactory.create_extractor(backend)
-        raw_text = await extractor.extract_text(pdf_bytes)
-        
-        if not raw_text.strip():
-            logger.warning("No text could be extracted from the provided PDF.")
-        logger.info(f"Extracted raw text length from PDF using {backend.value}: {len(raw_text)}")
-        return raw_text
-    except Exception as e:
-        logger.error(f"Failed to extract text from PDF using {backend.value}: {e}", exc_info=True)
-        raise ValueError(f"Text extraction from PDF failed: {str(e)}")
-async def extract_text_from_image(image_bytes: bytes, image_format: str) -> str:
-    raw_text = ""
-    try:
-        doc = fitz.open(stream=image_bytes, filetype=image_format)
-        for page_num in range(len(doc)):
-            page = doc.load_page(page_num)
-            text_from_page = page.get_text("text")
-            raw_text += text_from_page + "\n"
-        doc.close()
-        if not raw_text.strip():
-            logger.warning(f"No text could be extracted from image (format: {image_format}). May require OCR for scanned images.")
-        logger.info(f"Extracted raw text length from image: {len(raw_text)}")
-        return raw_text
-    except Exception as e:
-        logger.error(f"Failed to extract text from image: {e}", exc_info=True)
-        return "" # Allow LLM to attempt interpretation or note lack of text
-
-async def extract_bill_data_with_llm(raw_text: str) -> Dict[str, Any]:
-    prompt = f"""
-    Extract bill information as JSON matching the Pydantic schema below.
-    If the text is empty or contains no bill information, return a JSON object
-    with null or empty values for all fields.
-    Ensure the 'id', 'original_filename', 'raw_text', and 'q_and_a' fields are NOT part of your JSON output;
-    they will be added by the system.
-
-    Schema for your output (excluding id, original_filename, raw_text, q_and_a):
-    {{
-      "store_name": "Optional[str]",
-      "date": "Optional[str]",
-      "items": [
-        {{
-          "name": "str",
-          "qty": "Optional[int]",
-          "price": "Optional[float]"
-        }}
-      ],
-      "total": "Optional[float]",
-      "gst": "Optional[float]"
-    }}
-
-    Bill Text (if any):
-    ---
-    {raw_text if raw_text.strip() else "No text extracted from document."}
-    ---
-    JSON Output:
-    """
-    try:
-        completion = await aclient.chat.completions.create(
-            model=DEFAULT_MODEL,
-            messages=[
-                {"role": "system", "content": "You are an expert bill parsing assistant. Extract information into the provided JSON structure. If no bill data is found, provide empty/null fields for the requested schema."},
-                {"role": "user", "content": prompt}
-            ],
-            response_format={"type": "json_object"}
-        )
-        extracted_json_str = completion.choices[0].message.content
-        logger.debug(f"OpenAI response for bill parsing: {extracted_json_str}")
-        return json.loads(extracted_json_str)
-    except Exception as e:
-        logger.error(f"LLM bill data extraction failed: {e}", exc_info=True)
-        return {
-            "store_name": None, "date": None, "items": [],
-            "total": None, "gst": None
-        }
-
-async def save_bill_json(bill_data: BillData, base_dir: Path = ASSETS_BASE_DIR):
-    """Saves the bill data to a JSON file in the 'json' subdirectory of base_dir."""
-    json_dir = base_dir / "json"
-    json_path = json_dir / f"{bill_data.id}.json"
-    try:
-        with open(json_path, "w") as f:
-            json.dump(bill_data.model_dump(), f, indent=2)
-        logger.info(f"Bill data for {bill_data.id} (file: {bill_data.original_filename}) saved to {json_path}")
-    except Exception as e:
-        logger.error(f"Failed to save bill JSON for {bill_data.id} to {json_path}: {e}", exc_info=True)
-
-async def _internal_process_and_store_bill(
-    file_content: bytes,
-    original_doc_filename: str, # Filename from UPLOAD_DIR
-    text_extraction_func: callable,
-    file_type_for_log: str,
-    assets_copy_subdir: str, # "pdfs" or "images"
-    image_format: Optional[str] = None
-) -> BillData:
-    """
-    Internal helper: processes file content, extracts data, stores BillData, and saves a copy of the file.
-    """
-    logger.info(f"Internal processing for {file_type_for_log} (original: '{original_doc_filename}'), size: {len(file_content)} bytes")
-
-    # Directory where the COPY of the original file will be stored
-    copy_storage_dir = ASSETS_BASE_DIR / assets_copy_subdir
-    
-    # Use only the basename for the copy's filename
-    safe_filename_for_copy = Path(original_doc_filename).name 
-    file_path_for_copy = copy_storage_dir / safe_filename_for_copy
-
-    try:
-        with open(file_path_for_copy, "wb") as f:
-            f.write(file_content)
-        logger.info(f"Copy of {file_type_for_log} '{original_doc_filename}' saved to {file_path_for_copy}")
-    except Exception as e:
-        logger.error(f"Failed to save copy of {file_type_for_log} '{original_doc_filename}' to {file_path_for_copy}: {e}", exc_info=True)
-        # Continue processing if saving copy failed, as content is in memory
-
-    # Extract text using the appropriate function
-    if image_format: # For images
-        raw_text = await text_extraction_func(file_content, image_format)
-    else: # For PDFs
-        raw_text = await text_extraction_func(file_content)
-
-    # Parse data using LLM
-    parsed_llm_data = await extract_bill_data_with_llm(raw_text)
-
-    # Create and store BillData object
-    bill_id = await app_state.get_next_id()
-    bill = BillData(
-        id=bill_id,
-        original_filename=original_doc_filename, # Store the full original filename as passed
-        raw_text=raw_text,
-        **parsed_llm_data # Unpack LLM extracted fields
-    )
-
-    app_state.bills_store[bill.id] = bill # Store in memory
-    await save_bill_json(bill) # Save initial JSON (uses ASSETS_BASE_DIR by default)
-
-    logger.info(f"Successfully parsed and stored {file_type_for_log} as bill ID: {bill.id} (from original file: {original_doc_filename})")
-    return bill
 
 # ------------- FastMCP Setup ---------------
 mcp = FastMCP("Bill Processing MCP", dependencies=[
@@ -341,7 +96,7 @@ async def process_selected_bill_and_ask(original_filename: str, question: str) -
     'original_filename' is the name of the file as listed by 'discover_available_bills'.
     """
     logger.info(f"Request to process '{original_filename}' from uploads and answer question: '{question}'")
-
+    global app_state
     # 1. Check if bill is already processed and in memory (AppState)
     bill = await app_state.find_bill(original_filename) 
 
@@ -363,21 +118,23 @@ async def process_selected_bill_and_ask(original_filename: str, question: str) -
         file_ext = Path(original_filename).suffix.lower()
         
         if file_ext == ".pdf":
-            bill = await _internal_process_and_store_bill(
+            bill, app_state = await _internal_process_and_store_bill(
                 file_content=file_content,
                 original_doc_filename=original_filename,
                 text_extraction_func=extract_text_from_pdf,
                 file_type_for_log="PDF",
-                assets_copy_subdir="pdfs"
+                assets_copy_subdir="pdfs",
+                app_state=app_state,
             )
         elif file_ext in [".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".gif"]: # Added gif
-            bill = await _internal_process_and_store_bill(
+            bill, app_state = await _internal_process_and_store_bill(
                 file_content=file_content,
                 original_doc_filename=original_filename,
                 text_extraction_func=extract_text_from_image,
                 file_type_for_log="Image",
                 assets_copy_subdir="images",
-                image_format=file_ext.strip('.')
+                image_format=file_ext.strip('.'),
+                app_state=app_state,
             )
         else:
             logger.error(f"Unsupported file type for '{original_filename}': {file_ext}")
@@ -417,13 +174,15 @@ async def parse_pdf_bill(pdf_content: bytes, filename: str) -> BillData:
     logger.info(f"Direct PDF content parsing requested for filename: {filename}")
     try:
         # This will save a copy to assets/bills/pdfs/filename
-        return await _internal_process_and_store_bill(
+        bill, app_state = await _internal_process_and_store_bill(
             file_content=pdf_content,
             original_doc_filename=filename, # Treat passed filename as the key identifier
             text_extraction_func=extract_text_from_pdf,
             file_type_for_log="PDF (direct content)",
-            assets_copy_subdir="pdfs"
+            assets_copy_subdir="pdfs",
+            app_state=app_state,
         )
+        return bill
     except Exception as e:
         logger.error(f"Direct PDF parsing tool failed for '{filename}': {e}", exc_info=True)
         raise ValueError(f"PDF processing from content failed for '{filename}': {str(e)}")
@@ -436,18 +195,21 @@ async def parse_image_bill(image_content: bytes, filename: str, image_format: st
     """
     logger.info(f"Direct image content parsing requested for filename: {filename}, format: {image_format}")
     supported_formats = ["png", "jpeg", "jpg", "bmp", "tiff", "gif"]
+    global app_state
     if image_format.lower() not in supported_formats:
         raise ValueError(f"Unsupported image format: {image_format}. Supported: {', '.join(supported_formats)}")
     try:
          # This will save a copy to assets/bills/images/filename
-        return await _internal_process_and_store_bill(
+        bill, app_state = await _internal_process_and_store_bill(
             file_content=image_content,
             original_doc_filename=filename, # Treat passed filename as the key identifier
             text_extraction_func=extract_text_from_image,
             file_type_for_log="Image (direct content)",
             assets_copy_subdir="images",
-            image_format=image_format
+            image_format=image_format,
+            app_state=app_state,
         )
+        return bill
     except Exception as e:
         logger.error(f"Direct image parsing tool failed for '{filename}': {e}", exc_info=True)
         raise ValueError(f"Image processing from content failed for '{filename}': {str(e)}")

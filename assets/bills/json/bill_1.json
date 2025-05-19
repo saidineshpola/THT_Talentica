@@ -1,7 +1,7 @@
 {
   "id": "bill_1",
   "original_filename": "Amazonbill.pdf",
-  "store_name": "amazon.in",
+  "store_name": "Varasiddhi Silk Exports",
   "date": "28.10.2019",
   "items": [
     {
@@ -18,6 +18,11 @@
       "name": "Shipping Charges",
       "qty": 1,
       "price": 30.96
+    },
+    {
+      "name": "Shipping Charges",
+      "qty": 1,
+      "price": 30.96
     }
   ],
   "total": 1195.0,
@@ -26,7 +31,7 @@
   "q_and_a": [
     {
       "question": "What is the total amount billed?",
-      "answer": "The total amount billed is \u20b91,195.00."
+      "answer": "The total amount billed is 1,195.00."
     }
   ]
 }
