@@ -102,12 +102,19 @@ The Claude Desktop configuration should look like this:
 ```
 THT_Talentica/
 ├── .venv/
+├── assets/
 ├── logs/
 │   └── document_management.log
-├── exported_bills/
+├── .env
+├── .gitignore
+├── AI.readme.md
+├── evaluation.py
+├── pyproject.toml
+├── README.md
 ├── server.py
-├── requirements.txt
-└── project.yaml
+├── text_extractors.py
+├── utils.py
+└── uv.lock
 ```
 
 ## Error Handling
@@ -120,7 +127,3 @@ THT_Talentica/
 
 - Processed bills are stored in memory during runtime
 - Exported bills are saved in the `exported_bills` directory
-
-# load dot env
-from dotenv import load_dotenv
-load_dotenv()

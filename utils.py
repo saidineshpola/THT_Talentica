@@ -46,7 +46,7 @@ aclient = AsyncOpenAI(api_key=OPENAI_API_KEY)
 DEFAULT_MODEL = "gpt-4o-mini"
 
 
-logger = logging.getLogger("document_management.text_extractors")
+logger = logging.getLogger("document_management.utils")
 
 # ------------- Helper Functions ---------------
 def setup_directories():
