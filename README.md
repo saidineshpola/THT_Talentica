@@ -2,6 +2,11 @@
 
 A MCP-based server for processing and analyzing bill documents (PDFs and images)
 
+## Demo
+
+Checkout out an interactive demo of this server in action:
+[Claude Desktop Demo Conversation](https://claude.ai/share/68e6020b-e807-421c-b64a-a296e8216d13)
+
 ## Features
 
 - PDF and image bill parsing
